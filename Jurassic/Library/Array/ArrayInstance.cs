@@ -32,7 +32,7 @@ namespace Jurassic.Library
         /// <param name="prototype"> The next object in the prototype chain. </param>
         /// <param name="length"> The initial value of the length property. </param>
         /// <param name="capacity"> The number of elements to allocate. </param>
-        internal ArrayInstance(ObjectInstance prototype, uint length, uint capacity)
+        public ArrayInstance(ObjectInstance prototype, uint length, uint capacity)
             : base(prototype)
         {
             if (length > capacity)
@@ -57,7 +57,7 @@ namespace Jurassic.Library
         /// </summary>
         /// <param name="prototype"> The next object in the prototype chain. </param>
         /// <param name="elements"> The initial values in the array. </param>
-        internal ArrayInstance(ObjectInstance prototype, object[] elements)
+        public ArrayInstance(ObjectInstance prototype, object[] elements)
             : base(prototype)
         {
             if (elements == null)
