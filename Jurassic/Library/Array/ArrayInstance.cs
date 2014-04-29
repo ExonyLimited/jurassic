@@ -107,7 +107,7 @@ namespace Jurassic.Library
         /// Gets or sets the number of elements in the array.  Equivalent to the javascript
         /// Array.prototype.length property.
         /// </summary>
-        public uint Length
+        public virtual uint Length
         {
             get { return this.length; }
             set
