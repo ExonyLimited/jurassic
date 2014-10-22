@@ -14,6 +14,70 @@ namespace Jurassic.Library
         : System.Runtime.Serialization.IDeserializationCallback
 #endif
     {
+        #region Types
+        /// <summary>
+        /// A key which can be used to cache reflected type information
+        /// </summary>
+        private class TypeCacheKey : IEquatable<TypeCacheKey>
+        {
+            private readonly Type type;
+            private readonly BindingFlags bindingFlags;
+            private readonly int hashCode;
+            private object @lock;
+
+            public TypeCacheKey(Type type, BindingFlags bindingFlags)
+            {
+                this.type = type;
+                this.bindingFlags = bindingFlags;
+                hashCode = this.type.GetHashCode();
+            }
+
+            public override int GetHashCode()
+            {
+                return hashCode;
+            }
+
+            public object Lock 
+            { 
+                get 
+                { 
+                    if (@lock == null)
+                    {
+                        // in order to use the type name as a lock we must intern it
+                        @lock = string.Intern("Jurassic-TypeCacheKeyLock-" + this.type.Name);
+                    }
+                    return @lock; 
+                } 
+            }
+
+            #region IEquatable implementation
+            public bool Equals(TypeCacheKey other)
+            {
+                return Type.Equals(type, other.type) && bindingFlags == other.bindingFlags;
+            }
+            #endregion
+        }
+
+        /// <summary>
+        /// Stores cached property description information
+        /// </summary>
+        private class CachedPropertyDescriptorItem
+        {
+            public CachedPropertyDescriptorItem(string name, PropertyDescriptor descriptor)
+            {
+                Name = name;
+                Descriptor = descriptor;
+            }
+
+            public string Name { get; protected set; }
+            public PropertyDescriptor Descriptor { get; protected set; }
+        }
+        #endregion
+
+        // Cache methods and properties for like types
+        private static readonly Dictionary<TypeCacheKey, Dictionary<string, MethodGroup>>[] cachedMethodGroups = new Dictionary<TypeCacheKey, Dictionary<string, MethodGroup>>[8];
+        private static readonly Dictionary<TypeCacheKey, IList<CachedPropertyDescriptorItem>>[] cachedPropertyDescriptors = new Dictionary<TypeCacheKey, IList<CachedPropertyDescriptorItem>>[8];
+
         // The script engine associated with this object.
         [NonSerialized]
         private ScriptEngine engine;
@@ -43,6 +107,21 @@ namespace Jurassic.Library
 
         //     INITIALIZATION
         //_________________________________________________________________________________________
+
+        static ObjectInstance()
+        {
+            // initialize the method group cache
+            for (int i = 0; i < cachedMethodGroups.Length; i++)
+            {
+                cachedMethodGroups[i] = new Dictionary<TypeCacheKey, Dictionary<string, MethodGroup>>();
+            }
+
+            // initialize the property descriptor cache
+            for (int i = 0; i < cachedPropertyDescriptors.Length; i++)
+            {
+                cachedPropertyDescriptors[i] = new Dictionary<TypeCacheKey, IList<CachedPropertyDescriptorItem>>();
+            }
+        }
 
         /// <summary>
         /// Creates an Object with the default prototype.
@@ -1193,61 +1272,97 @@ namespace Jurassic.Library
         {
             if (type == null)
                 type = this.GetType();
-            
-            // Group the methods on the given type by name.
-            var functions = new Dictionary<string, MethodGroup>(20);
-            var methods = type.GetMethods(bindingFlags);
-            foreach (var method in methods)
+
+            var cacheKey = new TypeCacheKey(type, bindingFlags);
+
+            // attempt to get the method groups for the specified type from the cache
+            Dictionary<string, MethodGroup> functions = null;
+            var cachedMethodGroupsIndex = cacheKey.GetHashCode() % cachedMethodGroups.Length;
+            lock (cachedMethodGroups[cachedMethodGroupsIndex])
             {
-                // Make sure the method has the [JSInternalFunction] attribute.
-                var attribute = (JSFunctionAttribute)Attribute.GetCustomAttribute(method, typeof(JSFunctionAttribute));
-                if (attribute == null)
-                    continue;
+                cachedMethodGroups[cachedMethodGroupsIndex].TryGetValue(cacheKey, out functions);
+            }
 
-                // Determine the name of the method.
-                string name;
-                if (attribute.Name != null)
-                    name = attribute.Name;
-                else
-                    name = method.Name;
-
-                // Get a reference to the method group.
-                MethodGroup methodGroup;
-                if (functions.ContainsKey(name) == false)
+            // we missed the cache...
+            if (functions == null)
+            {
+                // lock with a type specific lock, prevents a race reflecting on the type
+                lock (cacheKey.Lock)
                 {
-                    methodGroup = new MethodGroup { Methods = new List<JSBinderMethod>(1), Length = -1 };
-                    functions.Add(name, methodGroup);
+                    // try the cache again...
+                    lock (cachedMethodGroups[cachedMethodGroupsIndex])
+                    {
+                        cachedMethodGroups[cachedMethodGroupsIndex].TryGetValue(cacheKey, out functions);
+                    }
+
+                    // the final cache miss, we have to reflect for real
+                    if (functions == null)
+                    {
+                        var methods = type.GetMethods(bindingFlags);
+
+                        functions = new Dictionary<string, MethodGroup>(methods.Length);
+            
+                        // Group the methods on the given type by name.
+                        foreach (var method in methods)
+                        {
+                            // Make sure the method has the [JSInternalFunction] attribute.
+                            var attribute = (JSFunctionAttribute)Attribute.GetCustomAttribute(method, typeof(JSFunctionAttribute));
+                            if (attribute == null)
+                                continue;
+
+                            // Determine the name of the method.
+                            string name;
+                            if (attribute.Name != null)
+                                name = attribute.Name;
+                            else
+                                name = method.Name;
+
+                            // Get a reference to the method group.
+                            MethodGroup methodGroup;
+                            if (functions.ContainsKey(name) == false)
+                            {
+                                methodGroup = new MethodGroup { Methods = new List<JSBinderMethod>(1), Length = -1 };
+                                functions.Add(name, methodGroup);
+                            }
+                            else
+                                methodGroup = functions[name];
+
+                            // Internal functions return nulls as undefined.
+                            if (attribute is JSInternalFunctionAttribute)
+                                attribute.Flags |= JSFunctionFlags.ConvertNullReturnValueToUndefined;
+
+                            // Add the method to the list.
+                            methodGroup.Methods.Add(new JSBinderMethod(method, attribute.Flags));
+
+                            // If the length doesn't equal -1, that indicates an explicit length has been set.
+                            // Make sure it is consistant with the other methods.
+                            if (attribute.Length >= 0)
+                            {
+                                if (methodGroup.Length != -1 && methodGroup.Length != attribute.Length)
+                                    throw new InvalidOperationException(string.Format("Inconsistant Length property detected on {0}.", method));
+                                methodGroup.Length = attribute.Length;
+                            }
+
+                            // Check property attributes.
+                            var descriptorAttributes = PropertyAttributes.Sealed;
+                            if (attribute.IsEnumerable)
+                                descriptorAttributes |= PropertyAttributes.Enumerable;
+                            if (attribute.IsConfigurable)
+                                descriptorAttributes |= PropertyAttributes.Configurable;
+                            if (attribute.IsWritable)
+                                descriptorAttributes |= PropertyAttributes.Writable;
+                            if (methodGroup.Methods.Count > 1 && methodGroup.PropertyAttributes != descriptorAttributes)
+                                throw new InvalidOperationException(string.Format("Inconsistant property attributes detected on {0}.", method));
+                            methodGroup.PropertyAttributes = descriptorAttributes;
+                        }
+
+                        // store the method group info in the cache
+                        lock (cachedMethodGroups[cachedMethodGroupsIndex])
+                        {
+                            cachedMethodGroups[cachedMethodGroupsIndex][cacheKey] = functions;
+                        }
+                    }
                 }
-                else
-                    methodGroup = functions[name];
-
-                // Internal functions return nulls as undefined.
-                if (attribute is JSInternalFunctionAttribute)
-                    attribute.Flags |= JSFunctionFlags.ConvertNullReturnValueToUndefined;
-
-                // Add the method to the list.
-                methodGroup.Methods.Add(new JSBinderMethod(method, attribute.Flags));
-
-                // If the length doesn't equal -1, that indicates an explicit length has been set.
-                // Make sure it is consistant with the other methods.
-                if (attribute.Length >= 0)
-                {
-                    if (methodGroup.Length != -1 && methodGroup.Length != attribute.Length)
-                        throw new InvalidOperationException(string.Format("Inconsistant Length property detected on {0}.", method));
-                    methodGroup.Length = attribute.Length;
-                }
-
-                // Check property attributes.
-                var descriptorAttributes = PropertyAttributes.Sealed;
-                if (attribute.IsEnumerable)
-                    descriptorAttributes |= PropertyAttributes.Enumerable;
-                if (attribute.IsConfigurable)
-                    descriptorAttributes |= PropertyAttributes.Configurable;
-                if (attribute.IsWritable)
-                    descriptorAttributes |= PropertyAttributes.Writable;
-                if (methodGroup.Methods.Count > 1 && methodGroup.PropertyAttributes != descriptorAttributes)
-                    throw new InvalidOperationException(string.Format("Inconsistant property attributes detected on {0}.", method));
-                methodGroup.PropertyAttributes = descriptorAttributes;
             }
 
             // Now set the relevant properties on the object.
@@ -1260,47 +1375,87 @@ namespace Jurassic.Library
                 this.FastSetProperty(name, new ClrFunction(this.Engine.Function.InstancePrototype, methodGroup.Methods, name, methodGroup.Length), methodGroup.PropertyAttributes);
             }
 
-            PropertyInfo[] properties = type.GetProperties(bindingFlags);
-            foreach (PropertyInfo prop in properties)
+            // attempt to get the property info from the cache
+            IList<CachedPropertyDescriptorItem> propertyDescriptors = null;
+            var cachedDescriptorsIndex = cacheKey.GetHashCode() % cachedPropertyDescriptors.Length;
+            lock (cachedPropertyDescriptors[cachedDescriptorsIndex])
             {
-                var attribute = Attribute.GetCustomAttribute(prop, typeof(JSPropertyAttribute), false) as JSPropertyAttribute;
-                if (attribute == null)
-                    continue;
+                cachedPropertyDescriptors[cachedDescriptorsIndex].TryGetValue(cacheKey, out propertyDescriptors);
+            }
 
-                // The property name.
-                string name;
-                if (attribute.Name != null)
-                    name = attribute.Name;
-                else
-                    name = prop.Name;
-
-                // The property getter.
-                ClrFunction getter = null;
-                if (prop.CanRead)
+            // we missed the cache....
+            if (propertyDescriptors == null)
+            {
+                // lock with a type specific lock, prevents a race reflecting on the type
+                lock (cacheKey.Lock)
                 {
-                    var getMethod = prop.GetGetMethod(true);
-                    getter = new ClrFunction(engine.Function.InstancePrototype, new JSBinderMethod[] { new JSBinderMethod(getMethod) }, name, 0);
+                    // try the cache again...
+                    lock (cachedPropertyDescriptors[cachedDescriptorsIndex])
+                    {
+                        cachedPropertyDescriptors[cachedDescriptorsIndex].TryGetValue(cacheKey, out propertyDescriptors);
+                    }
+
+                    // the final cache miss, we have to reflect for real
+                    if (propertyDescriptors == null)
+                    {
+                        PropertyInfo[] properties = type.GetProperties(bindingFlags);
+
+                        propertyDescriptors = new List<CachedPropertyDescriptorItem>(properties.Length);
+
+                        foreach (PropertyInfo prop in properties)
+                        {
+                            var attribute = Attribute.GetCustomAttribute(prop, typeof(JSPropertyAttribute), false) as JSPropertyAttribute;
+                            if (attribute == null)
+                                continue;
+
+                            // The property name.
+                            string name;
+                            if (attribute.Name != null)
+                                name = attribute.Name;
+                            else
+                                name = prop.Name;
+
+                            // The property getter.
+                            ClrFunction getter = null;
+                            if (prop.CanRead)
+                            {
+                                var getMethod = prop.GetGetMethod(true);
+                                getter = new ClrFunction(engine.Function.InstancePrototype, new JSBinderMethod[] { new JSBinderMethod(getMethod) }, name, 0);
+                            }
+
+                            // The property setter.
+                            ClrFunction setter = null;
+                            if (prop.CanWrite)
+                            {
+                                var setMethod = prop.GetSetMethod((bindingFlags & BindingFlags.NonPublic) != 0);
+                                if (setMethod != null)
+                                    setter = new ClrFunction(engine.Function.InstancePrototype, new JSBinderMethod[] { new JSBinderMethod(setMethod) }, name, 1);
+                            }
+
+                            // The property attributes.
+                            var descriptorAttributes = PropertyAttributes.Sealed;
+                            if (attribute.IsEnumerable)
+                                descriptorAttributes |= PropertyAttributes.Enumerable;
+                            if (attribute.IsConfigurable)
+                                descriptorAttributes |= PropertyAttributes.Configurable;
+
+                            // Define the property.
+                            var descriptor = new PropertyDescriptor(getter, setter, descriptorAttributes);
+                            propertyDescriptors.Add(new CachedPropertyDescriptorItem(name, descriptor));
+                        }
+
+                        // store the descriptors in the cache
+                        lock (cachedPropertyDescriptors[cachedDescriptorsIndex])
+                        {
+                            cachedPropertyDescriptors[cachedDescriptorsIndex].Add(cacheKey, propertyDescriptors);
+                        }
+                    }
                 }
+            }
 
-                // The property setter.
-                ClrFunction setter = null;
-                if (prop.CanWrite)
-                {
-                    var setMethod = prop.GetSetMethod((bindingFlags & BindingFlags.NonPublic) != 0);
-                    if (setMethod != null)
-                        setter = new ClrFunction(engine.Function.InstancePrototype, new JSBinderMethod[] { new JSBinderMethod(setMethod) }, name, 1);
-                }
-
-                // The property attributes.
-                var descriptorAttributes = PropertyAttributes.Sealed;
-                if (attribute.IsEnumerable)
-                    descriptorAttributes |= PropertyAttributes.Enumerable;
-                if (attribute.IsConfigurable)
-                    descriptorAttributes |= PropertyAttributes.Configurable;
-
-                // Define the property.
-                var descriptor = new PropertyDescriptor(getter, setter, descriptorAttributes);
-                this.DefineProperty(name, descriptor, true);
+            foreach (var descriptor in propertyDescriptors)
+            {
+                this.DefineProperty(descriptor.Name, descriptor.Descriptor, true);
             }
         }
 
