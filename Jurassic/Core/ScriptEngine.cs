@@ -42,9 +42,15 @@ namespace Jurassic
         private ErrorConstructor evalErrorConstructor;
         private ErrorConstructor referenceErrorConstructor;
 
+        // a collection where we can store engine specific context
+        [NonSerialized]
+        private readonly Dictionary<string, object> engineContext;
 
         public ScriptEngine()
         {
+            // add the engine context store
+            this.engineContext = new Dictionary<string, object>(StringComparer.Ordinal);
+
             // Create the initial hidden class schema.  This must be done first.
             this.emptySchema = HiddenClassSchema.CreateEmptySchema();
 
@@ -1152,6 +1158,26 @@ namespace Jurassic
                     this.staticTypeWrapperCache = new Dictionary<Type, ClrStaticTypeWrapper>();
                 return this.staticTypeWrapperCache;
             }
+        }
+
+        //     ENGINE CONTEXT
+        //_________________________________________________________________________________________
+
+        internal void AddContextObject(string key, object value)
+        {
+            engineContext[key] = value;
+        }
+
+        internal T GetContextObject<T>(string key) where T : class
+        {
+            object value = null;
+            engineContext.TryGetValue(key, out value);
+            return value as T;
+        }
+
+        internal bool RemoveContextObject(string key)
+        {
+            return engineContext.Remove(key);
         }
     }
 }
