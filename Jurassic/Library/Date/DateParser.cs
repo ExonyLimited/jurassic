@@ -52,7 +52,7 @@ namespace Jurassic.Library
                    (T (?<hour> [0-9]{2} )
                     : (?<minute> [0-9]{2} )
                    (: (?<second> [0-9]{2} )
-                  (\. (?<millisecond> [0-9]{3} ))?)?
+                  (\. (?<millisecond> [0-9]{3} ) [0-9]* )?)?
                       (?<zone> Z | (?<zoneHours> [+-][0-9]{2} ) : (?<zoneMinutes> [0-9]{2} ) )?)?$",
                 RegexOptions.ExplicitCapture | RegexOptions.Singleline | RegexOptions.IgnorePatternWhitespace);
             
