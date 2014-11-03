@@ -85,6 +85,15 @@ namespace Jurassic.Library
         }
 
         /// <summary>
+        /// Creates a new Date object from a CLR DateTime instance
+        /// </summary>
+        /// <param name="dateTime">The CLR DateTime</param>
+        public DateInstance Construct(DateTime dateTime)
+        {
+            return new DateInstance(this.InstancePrototype, dateTime);
+        }
+
+        /// <summary>
         /// Creates a new Date object from various date components, expressed in local time.
         /// </summary>
         /// <param name="year"> The full year. </param>
